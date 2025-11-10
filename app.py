@@ -1,4 +1,4 @@
-# app.py — fib Carbonation (ToW with t0 per fib B1.2-8) • one-column UI
+# app.py — fib Carbonation (B1.2-8 W(t) with t0) • one-column UI
 import math
 import numpy as np
 import pandas as pd
@@ -9,7 +9,6 @@ from scipy.stats import norm
 
 st.set_page_config(page_title="fib Carbonation – Reliability", layout="wide")
 
-# remove +/- spinners
 st.markdown("""
 <style>
 input[type=number]::-webkit-outer-spin-button,
@@ -48,21 +47,19 @@ def beta_interval_from_mean_sd(rng, n, mu, sd, L, U):
     a, b = beta01_shapes_from_mean_sd(mu01, sd01)
     return L + (U - L) * rng.beta(a, b, n)
 
-# ---------- core model (Excel-aligned; fib B1.2-8 for W(t)) ----------
-# xc(t) = sqrt(2 ke kc (kt*Racc_inv + eps) Cs) * sqrt(t) * W(t)
-# W(t)  = (t0 / t) ^ ( (pSR * ToW_years) ^ bw / 2 )
-def run_fib_carbonation_excel(params, N=100000, seed=42,
-                              t_start=0.0, t_end=120.0, t_points=240):
+# ---------- core model (fib B1.2-8 for W(t)) ----------
+# x_c(t) = sqrt(2 ke kc (kt*Racc_inv + eps) Cs) * sqrt(t) * W(t)
+# W(t)   = (t0 / t) ^ ( (pSR * ToW_years) ^ bw / 2 )
+def run_fib_carbonation(params, N=100000, seed=42,
+                        t_start=0.0, t_end=120.0, t_points=240):
     rng = np.random.default_rng(seed)
-
-    # avoid t=0 to prevent divide-by-zero in W(t)
     t_min = 1e-6
     t_years = np.linspace(float(max(t_start, t_min)), float(t_end), int(t_points))
 
-    # 1) a ~ LogNormal (mm)
+    # Cover a ~ LogNormal (mm)
     a_mm = lognorm_from_mu_sd(rng, N, params["a_mu_mm"], params["a_sd_mm"])
 
-    # 2) ke via RHreal (Beta[ L,U ] using mean/sd)
+    # ke from RH (Beta on [L,U] via mean/sd)
     RH_real = beta_interval_from_mean_sd(
         rng, N, mu=params["RH_mu"], sd=params["RH_sd"], L=params["RH_L"], U=params["RH_U"]
     )
@@ -70,42 +67,52 @@ def run_fib_carbonation_excel(params, N=100000, seed=42,
     fe, ge  = float(params["fe"]), float(params["ge"])
     ke = ((1.0 - (RH_real/100.0)**fe) / (1.0 - (RH_ref/100.0)**fe))**ge
 
-    # 3) kc = (tc/7)^bc
+    # kc = (tc/7)^bc (Normal)
     tc = float(params["tc_days"])
     bc = rng.normal(params["bc_mu"], params["bc_sd"], N)
     kc = (tc/7.0)**bc
 
-    # 4) Resistance term = kt*Racc_inv + eps  in (mm²/yr)/(kg/m³)
-    Racc_inv = lognorm_from_mu_sd(rng, N, params["Racc_inv_mu"], params["Racc_inv_sd"])
+    # R_ACC,0^{-1} ~ Normal in (m^2/s)/(kg/m^3); SD = 0.69 * mu**0.78
+    Racc_mu_m2s = float(params["Racc_mu_m2s"])
+    Racc_sd_m2s = 0.69 * (Racc_mu_m2s ** 0.78)
+    Racc_inv_m2s = rng.normal(Racc_mu_m2s, Racc_sd_m2s, N)
+    Racc_inv_m2s = np.maximum(Racc_inv_m2s, 1e-20)  # avoid negatives
+
+    # convert to (mm^2/yr)/(kg/m^3) to match the rest of the model units
+    SEC_PER_YR = 365.25 * 24 * 3600.0
+    M2_TO_MM2 = 1e6
+    Racc_inv = Racc_inv_m2s * M2_TO_MM2 * SEC_PER_YR  # (mm^2/yr)/(kg/m^3)
+
+    # ACC→NAC regression & error (Normal) – already in (mm^2/yr)/(kg/m^3)
     kt  = rng.normal(params["kt_mu"],  params["kt_sd"],  N)
     eps = rng.normal(params["eps_mu"], params["eps_sd"], N)
-    term = np.maximum(kt*Racc_inv + eps, 1e-12)
+    term = np.maximum(kt * Racc_inv + eps, 1e-12)
 
-    # 5) CO2 (kg/m³)
+    # Surface CO2 (Normal)
     Cs_atm = rng.normal(params["Cs_atm_mu"], params["Cs_atm_sd"], N)
     Cs_emi = rng.normal(params["Cs_emi_mu"], params["Cs_emi_sd"], N)
     Cs = np.maximum(Cs_atm + Cs_emi, 0.0)
 
-    # 6) Weather exponent w_sample = ((pSR * ToW_years)^bw)/2  (sample-wise)
+    # Weather exponent w_sample = ((pSR * ToW_years)^bw) / 2  (Normal for bw)
     pSR = float(params["pSR"])
     ToW_years = float(params["ToW_days"]) / 365.0
     bw  = rng.normal(params["bw_mu"], params["bw_sd"], N)
-    w_sample = ((pSR * ToW_years) ** bw) / 2.0  # shape (N,)
+    w_sample = ((pSR * ToW_years) ** bw) / 2.0
 
-    # 7) Base multiplier (sample-wise, independent of t)
-    K_base = np.sqrt(2.0 * ke * kc * term * Cs)  # shape (N,)
+    # Base multiplier per sample
+    K_base = np.sqrt(2.0 * ke * kc * term * Cs)
 
-    # 8) Time loop (apply W(t) per sample)
+    # Time loop with W(t) = (t0/t)^w_sample
     Pf = []
     t0_year = float(params["t0_year"])
     for t in t_years:
         t_safe = max(t, t_min)
-        W_vec = np.power(t0_year / t_safe, w_sample)    # shape (N,)
+        W_vec = np.power(t0_year / t_safe, w_sample)    # (N,)
         xc = K_base * math.sqrt(t_safe) * W_vec         # mm
         Pf.append(np.mean(xc >= a_mm))
     Pf = np.array(Pf)
     beta = beta_from_pf(Pf)
-    return pd.DataFrame({"t_years": t_years, "Pf": Pf, "beta": beta})
+    return pd.DataFrame({"t_years": t_years, "Pf": Pf, "beta": beta}), Racc_sd_m2s
 
 # ---------- plotting ----------
 def plot_beta(df_window, t_end, axes_cfg=None,
@@ -174,44 +181,54 @@ def plot_pf_only(x_years, y_pf):
     fig_pf.tight_layout()
     return fig_pf
 
-# ---------- one-column UI (no section headers) ----------
-# (delete the next line if you want zero page title)
+# ---------- one-column UI (labels include distribution types) ----------
 st.title("fib carbonation – one column (B1.2-8 W(t))")
 
-# Inputs (stacked)
-a_mu_mm  = st.number_input("Cover μ (mm)", value=44.96)
-a_sd_mm  = st.number_input("Cover σ (mm)", value=8.09)
+# Cover — LogNormal
+a_mu_mm  = st.number_input("Cover μ (mm) — LogNormal", value=44.96)
+a_sd_mm  = st.number_input("Cover σ (mm) — LogNormal", value=8.09)
 
-RH_mu    = st.number_input("RH_real mean (%)", value=70.0)
-RH_sd    = st.number_input("RH_real SD (%)", value=5.0)
-RH_L     = st.number_input("RH lower bound L (%)", value=40.0)
-RH_U     = st.number_input("RH upper bound U (%)", value=100.0)
-RH_ref   = st.number_input("RH_ref (%)", value=65.0)
-fe       = st.number_input("f_e", value=5.0)
-ge       = st.number_input("g_e", value=2.5)
+# RH_real — Beta on [L,U] via mean/sd
+RH_mu    = st.number_input("RH_real mean (%) — Beta[L,U]", value=70.0)
+RH_sd    = st.number_input("RH_real SD (%) — Beta[L,U]", value=5.0)
+RH_L     = st.number_input("RH lower bound L (%) — Beta[L,U]", value=40.0)
+RH_U     = st.number_input("RH upper bound U (%) — Beta[L,U]", value=100.0)
+RH_ref   = st.number_input("RH_ref (%) — Constant", value=65.0)
+fe       = st.number_input("f_e — Constant", value=5.0)
+ge       = st.number_input("g_e — Constant", value=2.5)
 
-tc_days  = st.number_input("t_c (days)", value=3.0)
-bc_mu    = st.number_input("b_c μ", value=-0.567, format="%.3f")
-bc_sd    = st.number_input("b_c σ", value=0.02, format="%.3f")
+# kc — Normal on b_c, then kc=(tc/7)^b_c
+tc_days  = st.number_input("t_c (days) — Constant", value=3.0)
+bc_mu    = st.number_input("b_c μ — Normal", value=-0.567, format="%.3f")
+bc_sd    = st.number_input("b_c σ — Normal", value=0.02, format="%.3f")
 
-Racc_inv_mu = st.number_input("R_ACC,0^{-1} μ  (mm²/yr)/(kg/m³)", value=2737.0, format="%.3f")
-Racc_inv_sd = st.number_input("R_ACC,0^{-1} σ  (mm²/yr)/(kg/m³)", value=1174.0, format="%.3f")
-kt_mu       = st.number_input("k_t μ", value=1.25)
-kt_sd       = st.number_input("k_t σ", value=0.35)
-eps_mu      = st.number_input("ε_t μ  (mm²/yr)/(kg/m³)", value=315.5, format="%.3f")
-eps_sd      = st.number_input("ε_t σ  (mm²/yr)/(kg/m³)", value=48.0, format="%.3f")
+# R_ACC,0^{-1} — Normal (m^2/s)/(kg/m^3); SD auto from μ
+Racc_mu_m2s = st.number_input("R_ACC,0^{-1} μ (m²/s)/(kg/m³) — Normal", value=8.67e-11, format="%.2e")
+# display computed SD; locked (comes from 0.69 * μ^0.78)
+Racc_sd_m2s_display = 0.69 * (Racc_mu_m2s ** 0.78)
+st.number_input("R_ACC,0^{-1} σ (m²/s)/(kg/m³) — Normal (auto: 0.69·μ^0.78)",
+                value=float(Racc_sd_m2s_display), format="%.2e", disabled=True)
 
-Cs_atm_mu = st.number_input("C_s,atm μ  (kg/m³)", value=1.63e-3, format="%.6f")
-Cs_atm_sd = st.number_input("C_s,atm σ  (kg/m³)", value=1.0e-6, format="%.6f")
-Cs_emi_mu = st.number_input("C_s,emi μ  (kg/m³)", value=0.0, format="%.6f")
-Cs_emi_sd = st.number_input("C_s,emi σ  (kg/m³)", value=1.0e-6, format="%.6f")
+# ACC→NAC regression & error — Normal, units (mm^2/yr)/(kg/m^3)
+kt_mu       = st.number_input("k_t μ — Normal", value=1.25)
+kt_sd       = st.number_input("k_t σ — Normal", value=0.35)
+eps_mu      = st.number_input("ε_t μ (mm²/yr)/(kg/m³) — Normal", value=315.5, format="%.3f")
+eps_sd      = st.number_input("ε_t σ (mm²/yr)/(kg/m³) — Normal", value=48.0, format="%.3f")
 
-pSR      = st.number_input("pSR (probability of driving rain)", value=0.090, format="%.3f")
-ToW_days = st.number_input("ToW (days with rainfall ≥2.5 mm)", value=22.0, format="%.1f")
-bw_mu    = st.number_input("b_w μ", value=0.446, format="%.3f")
-bw_sd    = st.number_input("b_w σ", value=0.163, format="%.3f")
-t0_year  = st.number_input("t₀ (years) – 28 days = 0.0767", value=0.0767, format="%.4f")
+# CO2 — Normal
+Cs_atm_mu = st.number_input("C_s,atm μ (kg/m³) — Normal", value=1.63e-3, format="%.6f")
+Cs_atm_sd = st.number_input("C_s,atm σ (kg/m³) — Normal", value=1.0e-6, format="%.6f")
+Cs_emi_mu = st.number_input("C_s,emi μ (kg/m³) — Normal", value=0.0, format="%.6f")
+Cs_emi_sd = st.number_input("C_s,emi σ (kg/m³) — Normal", value=1.0e-6, format="%.6f")
 
+# Weather + t0 — Normal on b_w
+pSR      = st.number_input("pSR — Constant", value=0.090, format="%.3f")
+ToW_days = st.number_input("ToW (days ≥2.5 mm) — Constant", value=22.0, format="%.1f")
+bw_mu    = st.number_input("b_w μ — Normal", value=0.446, format="%.3f")
+bw_sd    = st.number_input("b_w σ — Normal", value=0.163, format="%.3f")
+t0_year  = st.number_input("t₀ (years, 28 d = 0.0767) — Constant", value=0.0767, format="%.4f")
+
+# Window/MC/axes
 t_start_disp = st.number_input("Plot start time (yr)", value=0.0)
 t_end        = st.number_input("Plot end / target yr", value=120.0, min_value=0.0)
 t_points     = st.number_input("Number of time points", value=240, min_value=20, step=10)
@@ -235,7 +252,7 @@ if st.button("Run Simulation", type="primary"):
             RH_mu=float(RH_mu), RH_sd=float(RH_sd), RH_L=float(RH_L), RH_U=float(RH_U),
             RH_ref=float(RH_ref), fe=float(fe), ge=float(ge),
             tc_days=float(tc_days), bc_mu=float(bc_mu), bc_sd=float(bc_sd),
-            Racc_inv_mu=float(Racc_inv_mu), Racc_inv_sd=float(Racc_inv_sd),
+            Racc_mu_m2s=float(Racc_mu_m2s),
             kt_mu=float(kt_mu), kt_sd=float(kt_sd),
             eps_mu=float(eps_mu), eps_sd=float(eps_sd),
             Cs_atm_mu=float(Cs_atm_mu), Cs_atm_sd=float(Cs_atm_sd),
@@ -245,7 +262,7 @@ if st.button("Run Simulation", type="primary"):
             t0_year=float(t0_year),
         )
 
-        df_full = run_fib_carbonation_excel(
+        df_full, _r_sd = run_fib_carbonation(
             params, N=int(N), seed=int(seed),
             t_start=0.0, t_end=float(t_end), t_points=int(t_points)
         )
