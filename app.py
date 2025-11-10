@@ -1,5 +1,5 @@
-# --- REPLACE YOUR WHOLE app.py WITH THIS VERSION ---
-
+# app.py — fib Carbonation (B1.2-8 W(t) with t0)
+# R_ACC,0^{-1} mean from x_c & τ (m²/s)/(kg/m³); σ = 0.69 μ^0.78; includes mm²/yr ↔ m²/s converter
 import math
 import numpy as np
 import pandas as pd
@@ -17,7 +17,11 @@ input[type=number]{ -moz-appearance:textfield; }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------- helpers ----------------
+SEC_PER_YR = 365.25 * 24 * 3600.0
+MM2_TO_M2  = 1e-6
+M2_TO_MM2  = 1e6
+
+# ---------- helpers ----------
 def beta_from_pf(Pf: np.ndarray) -> np.ndarray:
     Pf = np.clip(Pf, 1e-12, 1-1e-12)
     return -norm.ppf(Pf)
@@ -46,7 +50,7 @@ def beta_interval_from_mean_sd(rng, n, mu, sd, L, U):
     a, b = beta01_shapes_from_mean_sd(mu01, sd01)
     return L + (U - L) * rng.beta(a, b, n)
 
-# ---------------- core model (B1.2-8 W(t)) ----------------
+# ---------- core model (fib B1.2-8) ----------
 # x_c(t) = sqrt(2 ke kc (kt*Racc_inv + eps) Cs) * sqrt(t) * W(t)
 # W(t)   = (t0 / t) ^ ( (pSR * ToW_years) ^ bw / 2 )
 def run_fib_carbonation(params, N=100000, seed=42,
@@ -58,7 +62,7 @@ def run_fib_carbonation(params, N=100000, seed=42,
     # 1) Cover a ~ LogNormal (mm)
     a_mm = lognorm_from_mu_sd(rng, N, params["a_mu_mm"], params["a_sd_mm"])
 
-    # 2) ke via RH_real (Beta [L,U] using mean/sd)
+    # 2) ke via RH_real (Beta [L,U] by mean/sd)
     RH_real = beta_interval_from_mean_sd(
         rng, N, mu=params["RH_mu"], sd=params["RH_sd"], L=params["RH_L"], U=params["RH_U"]
     )
@@ -66,42 +70,34 @@ def run_fib_carbonation(params, N=100000, seed=42,
     fe, ge  = float(params["fe"]), float(params["ge"])
     ke = ((1.0 - (RH_real/100.0)**fe) / (1.0 - (RH_ref/100.0)**fe))**ge
 
-    # 3) kc = (tc/7)^bc
+    # 3) kc = (tc/7)^bc (Normal on b_c)
     tc = float(params["tc_days"])
     bc = rng.normal(params["bc_mu"], params["bc_sd"], N)
     kc = (tc/7.0)**bc
 
-    # 4) R_ACC,0^{-1} source
-    SEC_PER_YR = 365.25 * 24 * 3600.0
-    M2_TO_MM2 = 1e6
+    # 4) R_ACC,0^{-1} from ACC: mu = (x_c / τ)^2  in (m^2/s)/(kg/m^3)
+    xc_m = float(params["xc_mm"]) / 1000.0
+    tau  = float(params["tau"])
+    mu_m2s = (xc_m / max(tau, 1e-12))**2
+    sd_m2s = 0.69 * (mu_m2s ** 0.78)
 
-    if params["racc_mode"] == "direct":
-        # μ entered in (m^2/s)/(kg/m^3); SD from rule σ=0.69 μ^0.78 (read-only in UI)
-        mu_m2s = float(params["Racc_mu_m2s"])
-    else:
-        # from ACC test: Racc = (xc/τ)^2. xc in mm → m; τ in (s/kg/m^3)^0.5
-        xc_m = float(params["xc_mm"]) / 1000.0
-        tau  = float(params["tau"])
-        mu_m2s = (xc_m / tau)**2
-
-    sd_m2s = 0.69 * (mu_m2s ** 0.78)  # from your chart
     Racc_inv_m2s = rng.normal(mu_m2s, sd_m2s, N)
     Racc_inv_m2s = np.maximum(Racc_inv_m2s, 1e-20)
 
-    # convert to (mm^2/yr)/(kg/m^3)
-    Racc_inv = Racc_inv_m2s * M2_TO_MM2 * SEC_PER_YR
+    # convert to (mm^2/yr)/(kg/m^3) for the resistance term
+    Racc_inv = Racc_inv_m2s * M2_TO_MM2 * SEC_PER_YR  # (mm^2/yr)/(kg/m^3)
 
-    # ACC→NAC regression & error (Normal) – already in (mm^2/yr)/(kg/m^3)
+    # ACC→NAC regression & error (Normal) – units (mm^2/yr)/(kg/m^3)
     kt  = rng.normal(params["kt_mu"],  params["kt_sd"],  N)
     eps = rng.normal(params["eps_mu"], params["eps_sd"], N)
     term = np.maximum(kt * Racc_inv + eps, 1e-12)
 
-    # 5) Surface CO2 (Normal)
+    # 5) Surface CO2 (Normal) – kg/m^3
     Cs_atm = rng.normal(params["Cs_atm_mu"], params["Cs_atm_sd"], N)
     Cs_emi = rng.normal(params["Cs_emi_mu"], params["Cs_emi_sd"], N)
     Cs = np.maximum(Cs_atm + Cs_emi, 0.0)
 
-    # 6) Weather exponent w_sample
+    # 6) Weather exponent
     pSR = float(params["pSR"])
     ToW_years = float(params["ToW_days"]) / 365.0
     bw  = rng.normal(params["bw_mu"], params["bw_sd"], N)
@@ -123,7 +119,7 @@ def run_fib_carbonation(params, N=100000, seed=42,
     beta = beta_from_pf(Pf)
     return pd.DataFrame({"t_years": t_years, "Pf": Pf, "beta": beta}), mu_m2s, sd_m2s
 
-# ---------------- plotting ----------------
+# ---------- plotting ----------
 def plot_beta(df_window, t_end, axes_cfg=None,
               show_pf=True, beta_target=None, show_beta_target=False,
               pf_mode="overlay"):
@@ -190,7 +186,7 @@ def plot_pf_only(x_years, y_pf):
     fig_pf.tight_layout()
     return fig_pf
 
-# ---------------- one-column UI ----------------
+# ---------- one-column UI ----------
 st.title("fib carbonation – one column (ACC→NAC, B1.2-8)")
 
 # Cover — LogNormal
@@ -211,25 +207,30 @@ tc_days  = st.number_input("t_c (days) — Constant", value=3.0)
 bc_mu    = st.number_input("b_c μ — Normal", value=-0.567, format="%.3f")
 bc_sd    = st.number_input("b_c σ — Normal", value=0.02, format="%.3f")
 
-# ---- R_ACC,0^{-1} input mode ----
-racc_mode = st.radio("R_ACC,0^{-1} source", ["Direct (Normal μ; σ=0.69·μ^0.78)", "Compute from ACC test (x_c, τ)"], index=0)
-if racc_mode.startswith("Direct"):
-    Racc_mu_m2s = st.number_input("R_ACC,0^{-1} μ (m²/s)/(kg/m³) — Normal", value=8.67e-11, format="%.2e")
-    Racc_sd_auto = 0.69 * (Racc_mu_m2s ** 0.78)
-    st.number_input("R_ACC,0^{-1} σ (m²/s)/(kg/m³) — auto from chart", value=float(Racc_sd_auto), format="%.2e", disabled=True)
-    xc_mm = None; tau = None
-else:
-    xc_mm = st.number_input("x_c (mm) — ACC measured depth", value=3.9, format="%.3f")
-    tau   = st.number_input("τ ((s/kg/m³)^0.5) — Constant", value=420.0, format="%.1f")
-    st.caption("R_ACC,0^{-1} = (x_c/τ)^2  (units → (m²/s)/(kg/m³)); σ set by 0.69·μ^0.78")
+# ---- ACC test inputs -> R_ACC,0^{-1} (m²/s)/(kg/m³) ----
+st.markdown("**R_ACC,0⁻¹ (mean from ACC test)**")
+xc_mm = st.number_input("x_c (mm) — ACC measured depth", value=3.9, format="%.3f")
+tau   = st.number_input("τ ((s/kg/m³)^0.5) — Constant", value=420.0, format="%.1f")
+# live preview: derived μ and σ in base units (m²/s)/(kg/m³)
+mu_preview = ( (xc_mm/1000.0) / max(tau, 1e-12) )**2
+sd_preview = 0.69 * (mu_preview ** 0.78)
+st.caption(f"Derived μ = {mu_preview:.3e}  (m²/s)/(kg/m³);  σ = 0.69·μ^0.78 = {sd_preview:.3e}")
 
-# ACC→NAC regression/error
+# ---- Convenience converter (does not drive the model) ----
+st.markdown("**Converter (for users who have values in (mm²/yr)/(kg/m³))**")
+mu_mm2yr_input = st.number_input("μ in (mm²/yr)/(kg/m³) — helper", value=2.737e3, format="%.3f")
+mu_m2s_from_mm2yr = mu_mm2yr_input * MM2_TO_M2 / SEC_PER_YR
+st.number_input("Converted μ in (m²/s)/(kg/m³) — helper", value=float(mu_m2s_from_mm2yr),
+                format="%.3e", disabled=True)
+st.caption("Note: the simulation still uses μ derived from x_c and τ above.")
+
+# ACC→NAC regression/error — Normal, units (mm²/yr)/(kg/m³)
 kt_mu       = st.number_input("k_t μ — Normal", value=1.25)
 kt_sd       = st.number_input("k_t σ — Normal", value=0.35)
 eps_mu      = st.number_input("ε_t μ (mm²/yr)/(kg/m³) — Normal", value=315.5, format="%.3f")
 eps_sd      = st.number_input("ε_t σ (mm²/yr)/(kg/m³) — Normal", value=48.0, format="%.3f")
 
-# CO2
+# CO2 — Normal
 Cs_atm_mu = st.number_input("C_s,atm μ (kg/m³) — Normal", value=1.63e-3, format="%.6f")
 Cs_atm_sd = st.number_input("C_s,atm σ (kg/m³) — Normal", value=1.0e-6, format="%.6f")
 Cs_emi_mu = st.number_input("C_s,emi μ (kg/m³) — Normal", value=0.0, format="%.6f")
@@ -266,6 +267,7 @@ if st.button("Run Simulation", type="primary"):
             RH_mu=float(RH_mu), RH_sd=float(RH_sd), RH_L=float(RH_L), RH_U=float(RH_U),
             RH_ref=float(RH_ref), fe=float(fe), ge=float(ge),
             tc_days=float(tc_days), bc_mu=float(bc_mu), bc_sd=float(bc_sd),
+            xc_mm=float(xc_mm), tau=float(tau),
             kt_mu=float(kt_mu), kt_sd=float(kt_sd),
             eps_mu=float(eps_mu), eps_sd=float(eps_sd),
             Cs_atm_mu=float(Cs_atm_mu), Cs_atm_sd=float(Cs_atm_sd),
@@ -273,10 +275,6 @@ if st.button("Run Simulation", type="primary"):
             pSR=float(pSR), ToW_days=float(ToW_days),
             bw_mu=float(bw_mu), bw_sd=float(bw_sd),
             t0_year=float(t0_year),
-            racc_mode=("direct" if racc_mode.startswith("Direct") else "from_acc"),
-            Racc_mu_m2s=(float(Racc_mu_m2s) if racc_mode.startswith("Direct") else None),
-            xc_mm=(float(xc_mm) if xc_mm is not None else None),
-            tau=(float(tau) if tau is not None else None),
         )
 
         df_full, mu_m2s, sd_m2s = run_fib_carbonation(
@@ -285,7 +283,13 @@ if st.button("Run Simulation", type="primary"):
         )
         df_window = df_full[(df_full["t_years"] >= float(max(t_start_disp, 1e-6))) &
                             (df_full["t_years"] <= float(t_end))].copy()
-        st.caption(f"Derived R_ACC,0^(-1) (m²/s)/(kg/m³): μ = {mu_m2s:.3e}, σ = {sd_m2s:.3e}  (σ=0.69·μ^0.78)")
+
+        # also show the μ derived from x_c,τ converted to (mm²/yr)/(kg/m³)
+        mu_mm2yr_from_xc_tau = mu_m2s * M2_TO_MM2 * SEC_PER_YR
+        st.caption(
+            f"Using μ(R_ACC,0⁻¹) from ACC: {mu_m2s:.3e} (m²/s)/(kg/m³) "
+            f"= {mu_mm2yr_from_xc_tau:.3e} (mm²/yr)/(kg/m³);  σ = {sd_m2s:.3e} (m²/s)/(kg/m³)"
+        )
 
         if df_window.empty:
             st.error("No points in display window; increase time points or adjust times.")
